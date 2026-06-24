@@ -4,22 +4,22 @@
 本プロジェクトは、「身近な人と話しているような感覚で、作業をしながら自然に対話ができるAIアシスタント」の実現を目的としたシステムです。
 ユーザーの音声入力をリアルタイムで認識し、AIがコンテキストや感情に応じた最適な回答を音声で出力する基本の会話ループを提供します。
 
-主要機能
-**リアルタイム音声対話**: マイクからの音声入力をトリガーとした、遅延の少ないAIとの音声会話。
-**音声生体認証**: 登録された話者の声を識別し、特定のユーザーのみを受け付ける認証機構。
-**感情モデルの搭載**: 会話内容に応じてAIの感情状態が動的に変化し、JSONファイルへの永続化に対応。
-**長期記憶（RAG）**: ベクトルデータベースを活用し、過去の会話履歴をコンテキストとして保持・呼び出し。
+**主要機能**
+* **リアルタイム音声対話**: マイクからの音声入力をトリガーとした、遅延の少ないAIとの音声会話。
+* **音声生体認証**: 登録された話者の声を識別し、特定のユーザーのみを受け付ける認証機構。
+* **感情モデルの搭載**: 会話内容に応じてAIの感情状態が動的に変化し、JSONファイルへの永続化に対応。
+* **長期記憶（RAG）**: ベクトルデータベースを活用し、過去の会話履歴をコンテキストとして保持・呼び出し。
 
 ---
 
-2. 技術スタック
-**LLM API**: Google Gemini API (`google-genai`)
-**音声認識 (STT)**: `faster-whisper`
-**音声合成 (TTS)**: `VOICEVOX`
-**ベクトルデータベース**: `ChromaDB`
-**埋め込みモデル**: `sentence-transformers`
-**話者認識 (Biometrics)**: `SpeechBrain`
-**オーディオI/O**: `PyAudio`, `SpeechRecognition`, `winsound`
+## 2. 技術スタック
+* **LLM API**: Google Gemini API (`google-genai`)
+* **音声認識 (STT)**: `faster-whisper`
+* **音声合成 (TTS)**: `VOICEVOX`
+* **ベクトルデータベース**: `ChromaDB`
+* **埋め込みモデル**: `sentence-transformers`
+* **話者認識 (Biometrics)**: `SpeechBrain`
+* **オーディオI/O**: `PyAudio`, `SpeechRecognition`, `winsound`
 
 ---
 
@@ -38,7 +38,7 @@
 
 ---
 
-4. セットアップと環境構築
+## 4. セットアップと環境構築
 前提条件
 **Pythonの推奨バージョン**: 3.12.7
 **VOICEVOX**: 実行環境で事前に起動している必要があります。
@@ -46,19 +46,19 @@
 手順
 4.1 リポジトリのクローンとインストール
    ```bash
-   git clone https://github.com/sazirosa891t5k-jpg/AI-Voice-Assistant-
-   cd AI-Voice-Assistants-
-   pip install -r requirements.txt
+      git clone https://github.com/sazirosa891t5k-jpg/AI-Voice-Assistant-
+      cd AI-Voice-Assistants-
+      pip install -r requirements.txt
    
-  .env.example をコピーして .env を作成し、必要なAPIキー（Gemini API)を設定してください。
-   cp .env.example .env
-  .env ファイルをエディタで開き、APIキーを入力
+     .env.example をコピーして .env を作成し、必要なAPIキー（Gemini API)を設定してください。
+      cp .env.example .env
+     .env ファイルをエディタで開き、APIキーを入力
 
 4.2　実行
-VOICEVOXを起動した状態で、以下のコマンドを実行してください。
-python main.py
+   VOICEVOXを起動した状態で、以下のコマンドを実行してください。
+   python main.py
 
-5. 技術的なこだわり・設計思想
+## 5. 技術的なこだわり・設計思想
 5.1「ウェイクワードレス」による自然な対話とトレードオフの制御
 従来のAIアシスタントに必須であったウェイクワード（「Hey Siri」等）は、人間らしい会話のテンポを阻害する要因になると考えました。
 本システムでは、あえて日常会話のスムーズさを最優先し、声紋認証のみで稼働するウェイクワードレス設計を採用しました。
