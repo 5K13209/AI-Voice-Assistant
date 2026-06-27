@@ -68,8 +68,10 @@ Whatの防御（audio_handlers.py）: faster-whisper 特有の、無音やノイ
   本システムはマイク入力やオーディオI/Oを直接制御するため、ローカル環境（PC実機）でのスタンドアロン動作を前提としています。クラウド上のコンテナ環境（Docker等）やサーバー環境では、オーディオデバイスの認識エラーが発生するためそのままでは動作しません。
 * **Windows環境におけるC++ビルドエラーに関する注意**
   pip install 実行時に Microsoft Visual C++ 14.0 or greater is required といったエラーが出る場合、C++のビルドツールが不足していますので、以下の対応をお願いします。
-* **PyAudioでエラーが出る場合**: バイナリ経由でインストールするため、pip install pipwin を実行後、pipwin install pyaudio をお試しください。
-* **その他のエラーの場合**: Microsoft C++ Build Toolsその他のエラーの場合: Microsoft C++ Build Tools をダウンロードし、「C++ によるデスクトップ開発」にチェックを入れてインストールした上で、再度 pip install を実行してください。
+
+  **PyAudioでエラーが出る場合**: バイナリ経由でインストールするため、pip install pipwin を実行後、pipwin install pyaudio をお試しください。
+
+  **その他のエラーの場合**: Microsoft C++ Build Toolsその他のエラーの場合: Microsoft C++ Build Tools をダウンロードし、「C++ によるデスクトップ開発」にチェックを入れてインストールした上で、再度 pip install を実行してください。
 
   ## 6. セットアップと環境構築
 前提条件
