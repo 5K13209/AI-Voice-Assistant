@@ -83,7 +83,7 @@ Whatの防御（audio_handlers.py）: faster-whisper 特有の、無音やノイ
 手順
 6.1 リポジトリのクローンとインストール
    ```bash
-    git clone https://github.com/sazirosa891t5k-jpg/AI-Voice-Assistant
+    git clone https://github.com/5K13209/AI-Voice-Assistant
     cd AI-Voice-Assistant
     #OSによってインストールするものが変わるため注意してください。
     #winOS
