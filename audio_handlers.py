@@ -9,7 +9,7 @@ from faster_whisper import WhisperModel
 
 from config import AUDIO_INPUT_KEYWORDS,AUDIO_OUTPUT_KEYWORDS,SPEAKER_ID,TEMP_USER_INPUT
     
-whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
+whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
 recognizer = sr.Recognizer()
 
