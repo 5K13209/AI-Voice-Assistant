@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import sounddevice as sd
 
@@ -22,12 +23,37 @@ from .config import (
 log = logging.getLogger(__name__)
 
 
+# OS が用意する集約エンドポイント。実デバイスではないので選ばない。
+# 「Microsoft サウンド マッパー」は名前に mic を含むため、素朴な部分一致だと
+# 本物のマイクより先に引っかかる。
+GENERIC_DEVICES = (
+    "サウンド マッパー",
+    "サウンドマッパー",
+    "sound mapper",
+    "プライマリ",
+    "primary sound",
+)
+
+
+def _matches(name: str, keyword: str) -> bool:
+    """キーワード一致。ASCII は単語境界で見る。
+
+    "mic" が "Microsoft" に一致してしまうのを防ぐ。日本語には単語境界が
+    無いので、そちらは部分一致のままにする。
+    """
+    if keyword.isascii():
+        return re.search(rf"\b{re.escape(keyword)}\b", name) is not None
+    return keyword in name
+
+
 def _find(devices, channel_key: str, keywords: list[str]) -> int | None:
     for index, dev in enumerate(devices):
         if dev[channel_key] <= 0:
             continue
         name = dev["name"].lower()
-        if any(kw.lower() in name for kw in keywords):
+        if any(generic in name for generic in GENERIC_DEVICES):
+            continue
+        if any(_matches(name, kw.lower()) for kw in keywords):
             return index
     return None
 
