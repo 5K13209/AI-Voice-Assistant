@@ -39,7 +39,8 @@ class MemoryManager:
         # ファイル保存
         self.memory["events"].append({
             "text": text,
-            "emotion": emotion,
+            # 参照のまま持つと全イベントが同じdictを指し、履歴が最新の感情値で埋まってしまう
+            "emotion": dict(emotion),
             "time": time.time()
         })
 

@@ -1,5 +1,6 @@
 import speech_recognition as sr
 import os
+import time
 import sounddevice as sd
 import soundfile as sf
 
@@ -13,18 +14,26 @@ class RegisterVoice:
         self.recognizer = sr.Recognizer()
 
 #　録音部分
-    def record_voice(self, output_path, duration=5, samplerate=16000): 
-        print("録音開始...")
-    
+    def record_voice(self, output_path, duration=5, samplerate=16000):
+        # 無告知で録音を始めると発話タイミングを外し、低品質なプロファイルが登録されてしまう
+        for count in range(3, 0, -1):
+            print(f"{count}...")
+            time.sleep(1)
+
+        print(f"録音開始...（{duration}秒間、話し続けてください）")
+
         # channels=1 でモノラル録音。dtype='float32' が音声処理ライブラリと相性が良い
         myrecording = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='float32')
-    
+
         # 録音終了までメインスレッドをブロックして待つ
         sd.wait()
         print("録音終了。")
-    
+
         # 必要に応じてWAVファイルとして保存
         sf.write(output_path, myrecording, samplerate)
+
+        # 呼び出し側(register)が参照パスとして受け取るため、保存先を返す
+        return output_path
 
 #　回数指定と返却
     def register(self):

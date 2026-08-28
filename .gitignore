@@ -5,7 +5,7 @@
 temp_file/*.wav
 voice_data/*.wav
 
-memory.jison
+memory.json
 
 *.wav
 *.mp3

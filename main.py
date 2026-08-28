@@ -6,7 +6,6 @@ import traceback
 
 from google import genai
 from google.genai import types
-from faster_whisper import WhisperModel
 
 from dotenv import load_dotenv
 
@@ -26,9 +25,7 @@ load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY)
 
-# --- Whisper ---
 print("--- 起動 ---")
-whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
 
 # --- モデル選択 ---
 def select_model():
@@ -46,14 +43,20 @@ MODEL_NAME = select_model()
 # =========================
 memory_manager = MemoryManager()
 
-if "emotion" in memory_manager.memory:
+saved_emotion = memory_manager.memory.get("toka_emotion")
+
+if saved_emotion:
     # あれば、前回のデータを引き継ぐ
-    toka_emotion = memory_manager.memory["emotion"]
+    # DEFAULT_EMOTIONとマージし、将来キーを増やしても古いmemory.jsonでKeyErrorにならないようにする
+    toka_emotion = {**DEFAULT_EMOTION, **saved_emotion}
 else:
-    # なければ、初期値（オール50）をセットして保存する（初回起動時のみここを通る）
-    toka_emotion = DEFAULT_EMOTION
-    memory_manager.memory["toka_emotion"] = toka_emotion
-    memory_manager.save_memory()
+    # なければ、初期値（オール50）をセットする（初回起動時のみここを通る）
+    # dict()でコピーしないと、update_emotionのin-place変更がconfigの定数を汚染する
+    toka_emotion = dict(DEFAULT_EMOTION)
+
+# 復元時も代入し直し、以後save_memory()が同一オブジェクトを書き出すようにする
+memory_manager.memory["toka_emotion"] = toka_emotion
+memory_manager.save_memory()
 
 config = types.GenerateContentConfig(
     system_instruction=f'あなたはトーカ。基本は冷静。現在の感情:好感度:{toka_emotion["like"]}怒り:{toka_emotion["anger"]}楽しさ:{toka_emotion["fun"]}信頼:{toka_emotion["trust"]}感情に応じて自然に会話してください.audio_timestamp=EMOTIONの各値は50が基準であり、それを下回ればマイナスの感情、超えるとプラスの感情。また最低0、最高を100とし、その値に適した形でロールプレイをして',
