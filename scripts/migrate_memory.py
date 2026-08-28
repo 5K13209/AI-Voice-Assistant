@@ -76,12 +76,30 @@ def migrate_events(memory: dict) -> tuple[list, int]:
     return migrated, changed
 
 
+def as_relative(path: str) -> str:
+    """リポジトリ内なら相対パスにする。移動しても壊れないように。"""
+    candidate = Path(path)
+    try:
+        return str(candidate.resolve().relative_to(config.ROOT.resolve()))
+    except ValueError:
+        return str(candidate)
+
+
 def recover_voice_refs(memory: dict) -> list[str]:
-    refs = [r for r in memory.get("voice_refs", []) if Path(r).exists()]
+    existing = memory.get("voice_refs", [])
+    refs = [
+        as_relative(r)
+        for r in existing
+        if (Path(r) if Path(r).is_absolute() else config.ROOT / r).exists()
+    ]
     if refs:
+        if refs != existing:
+            print(f"  {len(refs)} 件を相対パスに変換しました")
         return refs
 
-    found = sorted(str(p) for p in config.VOICE_DATA_DIR.glob("voice_*.wav"))
+    found = sorted(
+        str(p.relative_to(config.ROOT)) for p in config.VOICE_DATA_DIR.glob("voice_*.wav")
+    )
     if found:
         print(f"  voice_refs が空なので voice_data/ から {len(found)} 件復元します")
     return found

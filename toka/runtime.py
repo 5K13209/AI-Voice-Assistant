@@ -29,7 +29,7 @@ from .events import (
     StateChanged,
     UserMessage,
 )
-from .services.auth import AuthService, RegisterVoice, VoiceAuth
+from .services.auth import AuthService, RegisterVoice, VoiceAuth, resolve_ref
 from .services.capture import AudioCapture
 from .services.emotion import EmotionService, EpisodeSummarizer
 from .services.llm import LLMService
@@ -108,7 +108,7 @@ class Application:
             return None
 
         refs = self.memory.voice_refs
-        missing = [r for r in refs if not os.path.exists(r)]
+        missing = [r for r in refs if not resolve_ref(r).exists()]
         if not refs or missing:
             if missing:
                 log.info("登録済みの音声ファイルが見つからないため登録し直します")
