@@ -1,16 +1,36 @@
-chromadb==1.5.9
+# --- LLM ---
 google-genai==2.6.0
-faster-whisper==1.2.1
 python-dotenv==1.2.2
 requests==2.34.2
-SpeechRecognition==3.16.1
-speechbrain==1.0.3
-sentence-transformers==2.7.0
-torch==2.2.2
-torchaudio==2.2.2
-PyAudio==0.2.14
-numpy==1.26.4
+
+# --- 音声認識 (sherpa-onnx + ReazonSpeech) ---
+# CPU の ONNX 推論のみ。CUDA も PyTorch も要らない。
+# モデルは scripts/fetch_models.py で取得する。
+sherpa-onnx==1.13.6
+
+# --- 音声入出力 ---
+# 入力・出力とも sounddevice に統一した。PyAudio と SpeechRecognition は
+# 使わなくなったので依存から外してある（Windows でのビルド地獄も消える）。
 sounddevice==0.5.5
 soundfile==0.14.0
+numpy==1.26.4
 scipy==1.12.0
 
+# --- 話者照合 (SpeechBrain ECAPA) ---
+# torch を引くのはここだけ。声紋認証を切るなら丸ごと外せる。
+speechbrain==1.0.3
+torch==2.2.2
+torchaudio==2.2.2
+
+# --- 記憶 ---
+chromadb==1.5.9
+sentence-transformers==2.7.0
+
+# --- PC 操作ツール ---
+pycaw==20251023
+comtypes==1.4.16
+pyperclip==1.11.0
+
+# --- 任意: 旧 STT 経路との比較用 ---
+# TOKA_STT_ENGINE=whisper で使う。精度を自分の環境で比べたいときだけ。
+# faster-whisper==1.2.1

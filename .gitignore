@@ -5,10 +5,15 @@
 temp_file/*.wav
 voice_data/*.wav
 
-memory.jison
+memory.json
+memory.bak-*.json
+memory.broken-*.json
 
 *.wav
 *.mp3
+
+# ONNX モデル（3GB 近い。scripts/fetch_models.py で取得する）
+models/
 
 # エディタ設定
 .vscode/
