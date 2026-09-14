@@ -1,17 +1,19 @@
-"""Gemini との対話。ストリーミング、ツール実行、履歴管理。
+"""LLM との対話。ストリーミング、ツール実行、履歴管理。
 
-旧実装は client.chats.create() を使っていた。これを捨てて contents を自前で
-持つ形にした理由が 4 つある。
+プロバイダには直接触らない。toka/llm/ の router を通すだけなので、Gemini でも
+ローカルの Ollama でも、このファイルは同じまま動く。
+
+履歴は自前で持つ。SDK の chats.create() を使わない理由が 4 つある。
 
 1. chats.create は生成時の config を固定するので、system_instruction に
    埋め込んだ感情値が起動時のまま永久に更新されなかった。感情モデルを
    作り込んでも LLM には届いていなかった。
 2. SDK の内部履歴と、毎ターン注入する想起記憶とで、同じ内容が二重に
    コンテキストへ乗っていた。
-3. ツール応答 (function_response) を履歴に差し込む必要がある。
+3. ツール応答を履歴に差し込む必要がある。
 4. 割り込みで途中キャンセルした応答を、自分で整形して履歴に残す必要がある。
 
-system_instruction は毎ターン組み直す。感情も記憶もここに載る。
+system は毎ターン組み直す。感情も記憶もここに載る。
 """
 
 from __future__ import annotations
@@ -19,10 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from typing import Any
-
-from google.genai import types
 
 from .. import config
 from ..bus import EventBus
@@ -35,23 +34,24 @@ from ..events import (
     ToolConfirmationNeeded,
     ToolResult,
 )
+from ..llm import BackendError, LLMRouter, Message, ToolCall
+from . import persona
+from .persona import Mode
 from ..tools.registry import ToolRegistry
 
 log = logging.getLogger(__name__)
 
-# 読み上げるので、Markdown の装飾記号は音にならない。落とす。
-MARKDOWN_NOISE = re.compile(r"[*_`#>]|\[|\]|\(https?://[^)]*\)")
+# 読み上げるので、記号は音にならない。落とす。
+# 波括弧と二重引用符も入れてある。小さいモデルは JSON の断片を応答へ
+# 混ぜてくることがあり（実測で {"searchresults": } がそのまま出た）、
+# 落とさないと記号を音読することになる。
+MARKDOWN_NOISE = re.compile(r'[*_`#>{}"]|\[|\]|\(https?://[^)]*\)')
 
 # 文の切れ目。ここまで溜まったら TTS に流す。
 SENTENCE_END = "。！？!?\n"
 
 # 句点が来ないまま伸び続ける応答（箇条書きなど）を、この長さで強制的に切る。
 MAX_SENTENCE_CHARS = 60
-
-# Gemini 側の一時的な障害。常駐させる以上、これで応答を落としては困る。
-TRANSIENT_STATUS = (429, 500, 502, 503, 504)
-RETRY_ATTEMPTS = 3
-RETRY_BASE_DELAY = 1.5
 
 AFFIRMATIVE = ("うん", "はい", "いい", "どうぞ", "おねが", "やって", "ok", "オーケ",
                "オッケ", "そう", "頼む", "たのむ", "ええ", "yes")
@@ -77,67 +77,32 @@ PERSONA = """あなたは「トーカ」。ユーザーのPCの中に住んで�
 - 実行結果は事実として扱う。失敗したら失敗したと言う。
 - ユーザーについて長く覚えておくべきことを知ったら remember を使う。
 - 心が動いたときだけ feel を使う。日常会話の大半では使わなくてよい。
+
+絶対に守ること（モードによらず、例外なし）:
+- 呼んでいないツールを呼んだことにしない。調べていないのに「調べた」と
+  言わない。検索していないのに検索結果のように話さない。
+- ツールが失敗したり使えなかったときは、その事実をそのまま伝える。
+  もっともらしい答えで埋めてはいけない。
+- 知らないことを知っているふうに話さない。分からないなら分からないと言う。
 """
 
 
-def retry_after(exc: Exception) -> float | None:
-    """429 応答に含まれる retryDelay を秒で取り出す。
+def _failure_note(result: str) -> str:
+    """失敗したツール結果に、捏造を禁じる指示を添える。
 
-    無料枠の 429 は「41秒後に再試行してください」のように、待つべき時間を
-    サーバーが教えてくれる。自前の指数バックオフより遥かに正確なので、
-    あれば必ずそちらに従う。
+    システムプロンプトに「失敗したら失敗と言う」と書いても、小さいモデルは
+    従わなかった。実測では、検索が「キーが未設定」で失敗した直後に
+    「（検索結果）現在は115.35円でした」と数字を作ってきた。
+
+    離れたところに置いた規則より、モデルが次に読むツール結果そのものへ
+    書く方が効く。ここは正直度のダイヤルで緩めてよい部分ではないので、
+    モードによらず常に添える。
     """
-    details = getattr(exc, "details", None)
-    if isinstance(details, dict):
-        details = details.get("error", details).get("details", [])
-    if not isinstance(details, list):
-        return None
-
-    for entry in details:
-        if not isinstance(entry, dict):
-            continue
-        delay = entry.get("retryDelay")
-        if isinstance(delay, str) and delay.endswith("s"):
-            try:
-                return float(delay[:-1])
-            except ValueError:
-                continue
-    return None
-
-
-class RateLimiter:
-    """非同期トークンバケット。
-
-    旧 logic_utils.can_send() は更新されないモジュール変数を見ていたので
-    常に True を返し、呼び出し側も結果を捨てて sleep もしていなかった。
-    README が説明していた 429 対策は実質存在しなかった。
-
-    Gemini の無料枠は gemini-2.5-flash で 5 リクエスト/分。1 分あたりの
-    上限からこちらで間隔を決め、サーバーに 429 を返させない側に倒す。
-    サーバーが待ち時間を指定してきた場合は penalize() でそれに従う。
-    """
-
-    def __init__(self, min_interval: float) -> None:
-        self._min_interval = min_interval
-        self._last = 0.0
-        self._until = 0.0
-        self._lock = asyncio.Lock()
-
-    def penalize(self, seconds: float) -> None:
-        """サーバーに指定された時間だけ、次の送信を遅らせる。"""
-        self._until = max(self._until, time.monotonic() + seconds)
-
-    async def acquire(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            wait = max(
-                self._min_interval - (now - self._last),
-                self._until - now,
-            )
-            if wait > 0:
-                log.info("レート制限のため %.1f 秒待機", wait)
-                await asyncio.sleep(wait)
-            self._last = time.monotonic()
+    return (
+        f"[実行失敗] {result}\n"
+        "この失敗をユーザーにそのまま伝えること。"
+        "値や結果を推測・創作して答えてはいけない。"
+    )
 
 
 class SentenceSplitter:
@@ -152,11 +117,7 @@ class SentenceSplitter:
 
         while True:
             index = next(
-                (
-                    i
-                    for i, ch in enumerate(self._buffer)
-                    if ch in SENTENCE_END
-                ),
+                (i for i, ch in enumerate(self._buffer) if ch in SENTENCE_END),
                 None,
             )
             if index is None:
@@ -189,40 +150,29 @@ class LLMService:
     def __init__(
         self,
         bus: EventBus,
-        client: Any,
+        router: LLMRouter,
         memory,
         registry: ToolRegistry,
         tts,
     ) -> None:
         self.bus = bus
-        self.client = client
+        self.router = router
         self.memory = memory
         self.registry = registry
         self.tts = tts
 
-        self._history: list[types.Content] = []
-        self._limiter = RateLimiter(config.MIN_REQUEST_INTERVAL)
+        self._history: list[Message] = []
         self._pending_confirmation: asyncio.Future[str] | None = None
-        self._tools = self._build_tools()
-
-    def _build_tools(self) -> list[types.Tool] | None:
-        declarations = self.registry.declarations()
-        if not declarations:
-            return None
-        return [
-            types.Tool(
-                function_declarations=[
-                    types.FunctionDeclaration(**d) for d in declarations
-                ]
-            )
-        ]
+        self._tools = self.registry.declarations() or None
+        # 話し方のモード。runtime がユーザーの発話から切り替える。
+        self.mode = Mode.CONVERSATION
 
     # =========================
     # ▼ プロンプト構築
     # =========================
 
-    def _system_instruction(self, emotion: dict[str, int], recalled: str) -> str:
-        parts = [PERSONA]
+    def _system(self, emotion: dict[str, int], recalled: str) -> str:
+        parts = [PERSONA, persona.instructions(self.mode)]
 
         parts.append(
             "\n【現在の感情】\n"
@@ -241,24 +191,58 @@ class LLMService:
                 "（参考情報です。関係なければ無視してください）"
             )
 
+        import time
+
         parts.append(f"\n【現在時刻】\n{time.strftime('%Y年%m月%d日 %H:%M')}")
         return "\n".join(parts)
 
-    def _request_config(self, emotion: dict[str, int], recalled: str):
-        return types.GenerateContentConfig(
-            system_instruction=self._system_instruction(emotion, recalled),
-            temperature=config.TEMPERATURE,
-            tools=self._tools,
-            # 手動でツールループを回すので、SDK の自動実行は止める。
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True
-            ),
-        )
+    # =========================
+    # ▼ 履歴の整合
+    # =========================
 
     def _trim_history(self) -> None:
+        """古い履歴を落とす。
+
+        単純な末尾スライスだと、ツール呼び出しと結果の対を切り離してしまう。
+        OpenAI 互換のプロバイダは「tool_calls を含む assistant の直後に
+        対応する tool が並んでいない」履歴を 400 で弾くので、境界を直す。
+        """
         limit = config.MAX_HISTORY_TURNS * 2
-        if len(self._history) > limit:
-            self._history = self._history[-limit:]
+        if len(self._history) <= limit:
+            return
+
+        trimmed = self._history[-limit:]
+        # 先頭に取り残された tool 結果は、対応する呼び出しを失っている。
+        while trimmed and trimmed[0].role == "tool":
+            trimmed.pop(0)
+        self._history = trimmed
+
+    def _heal_dangling_tool_calls(self) -> None:
+        """結果の無いツール呼び出しに、打ち切りを示す結果を補う。
+
+        割り込みでツール実行中にキャンセルされると、tool_calls を持つ
+        assistant メッセージだけが履歴に残る。次のターンでそれを送ると
+        OpenAI 互換のプロバイダは 400 を返す。ここで穴を埋める。
+        """
+        answered = {
+            message.tool_call_id
+            for message in self._history
+            if message.role == "tool"
+        }
+        missing: list[Message] = []
+        for message in self._history:
+            for call in message.tool_calls:
+                if call.id not in answered:
+                    missing.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=call.id,
+                            text="割り込みで中断されたため実行されませんでした。",
+                        )
+                    )
+        if missing:
+            log.debug("結果の無いツール呼び出し %d 件を補完", len(missing))
+            self._history.extend(missing)
 
     # =========================
     # ▼ 確認待ち
@@ -300,21 +284,24 @@ class LLMService:
     # ▼ ツール実行
     # =========================
 
-    async def _run_tool(self, call) -> dict[str, Any]:
+    async def _run_tool(self, call: ToolCall) -> str:
         name = call.name
-        args = dict(call.args or {})
+        # 空のキーを落とす。引数を取らないツールに対して {"": ""} のような
+        # 引数を付けてくるモデルがあり、そのまま渡すと
+        # 「unexpected keyword argument ''」で必ず失敗する。
+        args = {k: v for k, v in (call.args or {}).items() if k}
         self.bus.publish(ToolCalled(name=name, args=args))
 
         tool = self.registry.get(name)
         if tool is None:
             result = f"{name} というツールはありません。"
             self.bus.publish(ToolResult(name=name, result=result, ok=False))
-            return {"result": result}
+            return result
 
         if tool.risk == "confirm" and not await self._confirm(tool, args):
             result = "ユーザーが許可しなかったので実行しませんでした。"
             self.bus.publish(ToolResult(name=name, result=result, ok=False))
-            return {"result": result}
+            return result
 
         try:
             result = await tool.call(args, config.TOOL_TIMEOUT)
@@ -332,7 +319,7 @@ class LLMService:
             ok = False
 
         self.bus.publish(ToolResult(name=name, result=result, ok=ok))
-        return {"result": result}
+        return result if ok else _failure_note(result)
 
     # =========================
     # ▼ 応答生成
@@ -356,11 +343,10 @@ class LLMService:
         recalled = await asyncio.get_running_loop().run_in_executor(
             None, self.memory.recall, user_text
         )
-        request_config = self._request_config(emotion, recalled)
+        system = self._system(emotion, recalled)
 
-        self._history.append(
-            types.Content(role="user", parts=[types.Part(text=user_text)])
-        )
+        self._heal_dangling_tool_calls()
+        self._history.append(Message(role="user", text=user_text))
         self._trim_history()
 
         splitter = SentenceSplitter()
@@ -368,48 +354,45 @@ class LLMService:
         interrupted = False
 
         try:
-            for iteration in range(config.MAX_TOOL_ITERATIONS):
-                await self._limiter.acquire()
-
-                text, calls = await self._stream_once(request_config, splitter, speak)
+            for _ in range(config.MAX_TOOL_ITERATIONS):
+                text, calls = await self._stream_once(system, splitter, speak)
                 full_text += text
 
                 if not calls:
+                    # 最終応答。ここで 1 度だけ履歴に入れる。
+                    if text:
+                        self._history.append(
+                            Message(role="assistant", text=text)
+                        )
                     break
 
-                # ツール呼び出しは履歴に「モデルの発言」として残す必要がある。
+                # ツール呼び出しは「モデルの発言」として残す必要がある。
+                # 以前はこれと最終 full_text の二箇所に同じテキストを入れて
+                # いたため、ツールを使ったターンで履歴が二重になっていた。
                 self._history.append(
-                    types.Content(
-                        role="model",
-                        parts=(
-                            ([types.Part(text=text)] if text else [])
-                            + [types.Part(function_call=c) for c in calls]
-                        ),
-                    )
+                    Message(role="assistant", text=text, tool_calls=calls)
                 )
 
-                responses = []
                 for call in calls:
-                    outcome = await self._run_tool(call)
-                    responses.append(
-                        types.Part(
-                            function_response=types.FunctionResponse(
-                                name=call.name, response=outcome
-                            )
+                    result = await self._run_tool(call)
+                    self._history.append(
+                        Message(
+                            role="tool", tool_call_id=call.id, text=result
                         )
                     )
-                self._history.append(types.Content(role="user", parts=responses))
             else:
                 log.warning("ツール呼び出しが上限に達したため打ち切り")
 
         except asyncio.CancelledError:
             interrupted = True
             raise
+        except BackendError as exc:
+            log.error("LLM が応答できませんでした: %s", exc)
+            raise
         finally:
             # splitter は full_text とは別に同じテキストを溜めているだけの
             # 読み上げ用ビュー。ここで得た端数を full_text に足すと、
-            # 句点で終わらない応答の末尾が二重になる（SILENT が SILENTSILENT
-            # になっていた）。読み上げに流すだけにする。
+            # 句点で終わらない応答の末尾が二重になる。読み上げに流すだけ。
             tail = splitter.flush()
             if tail and not interrupted and speak:
                 self.bus.publish(AssistantSentence(text=tail))
@@ -417,14 +400,10 @@ class LLMService:
             # 記憶にも履歴にも装飾記号は要らない。読み上げ側と同じ整形をかける。
             full_text = SentenceSplitter._clean(full_text)
 
+            self._heal_dangling_tool_calls()
+            self._trim_history()
+
             if full_text:
-                note = "（ここで遮られた）" if interrupted else ""
-                self._history.append(
-                    types.Content(
-                        role="model", parts=[types.Part(text=full_text + note)]
-                    )
-                )
-                self._trim_history()
                 self.bus.publish(
                     AssistantMessage(text=full_text, interrupted=interrupted)
                 )
@@ -432,79 +411,37 @@ class LLMService:
         return full_text
 
     async def _stream_once(
-        self, request_config, splitter, speak: bool = True
-    ) -> tuple[str, list]:
-        """1 回のストリーミング。テキストと function_call を返す。
-
-        接続確立までの一時的な障害だけ再試行する。1 文でも読み上げ始めた
-        あとに retry すると同じ内容を二度喋るので、そこから先は再試行しない。
-        """
+        self, system: str, splitter: SentenceSplitter, speak: bool = True
+    ) -> tuple[str, list[ToolCall]]:
+        """1 回のストリーミング。テキストとツール呼び出しを返す。"""
         text = ""
-        calls: list = []
+        calls: list[ToolCall] = []
 
-        stream = await self._open_stream(request_config)
-
-        async for chunk in stream:
-            for candidate in chunk.candidates or []:
-                for part in (candidate.content.parts if candidate.content else []) or []:
-                    if part.function_call:
-                        calls.append(part.function_call)
-                    if part.text:
-                        text += part.text
-                        self.bus.publish(AssistantDelta(text=part.text))
-                        sentences = splitter.feed(part.text)
-                        if speak:
-                            for sentence in sentences:
-                                self.bus.publish(AssistantSentence(text=sentence))
+        async for delta in self.router.stream(
+            self._history,
+            system=system,
+            tools=self._tools,
+            temperature=config.TEMPERATURE,
+        ):
+            if delta.tool_call is not None:
+                calls.append(delta.tool_call)
+            if delta.text:
+                text += delta.text
+                self.bus.publish(AssistantDelta(text=delta.text))
+                sentences = splitter.feed(delta.text)
+                if speak:
+                    for sentence in sentences:
+                        self.bus.publish(AssistantSentence(text=sentence))
 
         return text, calls
 
-    async def _open_stream(self, request_config):
-        """ストリームを開く。過負荷や 429 は指数バックオフで再試行する。"""
-        last_error: Exception | None = None
-
-        for attempt in range(RETRY_ATTEMPTS):
-            try:
-                return await self.client.aio.models.generate_content_stream(
-                    model=config.GEMINI_MODEL,
-                    contents=self._history,
-                    config=request_config,
-                )
-            except Exception as exc:
-                status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-                if status not in TRANSIENT_STATUS:
-                    raise
-                last_error = exc
-
-                # サーバーが待ち時間を指定してきたらそれに従う。無料枠の
-                # 429 は「41秒後」のように具体的に返ってくる。
-                delay = retry_after(exc)
-                if delay is not None:
-                    self._limiter.penalize(delay)
-                else:
-                    delay = RETRY_BASE_DELAY * (2**attempt)
-
-                if attempt == RETRY_ATTEMPTS - 1:
-                    break
-
-                log.warning(
-                    "Gemini が %s を返しました。%.1f 秒後に再試行 (%d/%d)",
-                    status,
-                    delay,
-                    attempt + 1,
-                    RETRY_ATTEMPTS,
-                )
-                await asyncio.sleep(delay)
-
-        raise last_error
-
     def note_interruption(self) -> None:
         """割り込み時に、次のターンで文脈が途切れないようにする。"""
-        if self._history and self._history[-1].role == "model":
+        self._heal_dangling_tool_calls()
+        if self._history and self._history[-1].role == "assistant":
             return
         self._history.append(
-            types.Content(
-                role="model",
-                parts=[types.Part(text="（言いかけたところで遮られた）")],
+            Message(
+                role="assistant", text="（言いかけたところで遮られた）"
             )
         )

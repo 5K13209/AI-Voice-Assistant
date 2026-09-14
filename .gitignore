@@ -29,3 +29,6 @@ venv/
 .venv2/
 .venv5/
 .venv6/
+
+# pytest
+.pytest_cache/

@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+# 日本語のテスト名を読みやすく出す。
+addopts = "-v --tb=short"
+filterwarnings = [
+    # sentence-transformers / speechbrain が古い API を使っている。
+    "ignore::DeprecationWarning",
+]

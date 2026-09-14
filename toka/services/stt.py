@@ -146,6 +146,15 @@ class STTService:
         self._last_partial = 0.0
         self._partial_text = ""
 
+    @property
+    def transcriber(self) -> Transcriber:
+        """認識器。声紋登録の音声を文字起こしするのに外から使う。
+
+        モデルのロードは数秒かかるので、登録用に別インスタンスを作らず
+        ここを共有する。
+        """
+        return self._transcriber
+
     def set_speaking(self, speaking: bool) -> None:
         """TTS 再生中かどうか。再生中は自分の声を拾いやすいので VAD を鈍らせる。
 

@@ -1,0 +1,10 @@
+# 開発用。本体の実行には不要。
+#
+#   pip install -r requirements-dev.txt
+#   pytest
+#
+# テストは外部への通信もモデルのロードも行わないので、数秒で終わる。
+-r requirements.txt
+
+pytest==8.3.4
+pytest-asyncio==0.25.2

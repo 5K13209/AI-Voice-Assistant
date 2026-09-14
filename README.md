@@ -19,7 +19,7 @@
 
 | 用途 | 採用 |
 | :--- | :--- |
-| LLM | Google Gemini API (`google-genai`) — ストリーミング + function calling |
+| LLM | 差し替え可能。ローカル (**Ollama** / LM Studio) と Cerebras / Groq / OpenRouter / Gemini。既定はローカル |
 | 音声認識 (STT) | `sherpa-onnx` 上の **ReazonSpeech k2-v2 Zipformer**（CPU / INT8 / ONNX） |
 | 発話区間検出 (VAD) | Silero VAD（sherpa-onnx 同梱） |
 | 音声合成 (TTS) | `VOICEVOX`（HTTP API） |
@@ -42,24 +42,35 @@ toka/
   config.py        設定値の一元管理
   audio_devices.py 入出力デバイスの選択
   model_files.py   ONNX モデルのファイル名解決
+  llm/
+    types.py       プロバイダ非依存の会話表現 (Message / ToolCall / Delta)
+    base.py        ChatBackend プロトコル
+    openai_compat.py  Ollama / LM Studio / Groq / Cerebras / OpenRouter
+    gemini.py      Gemini（固有の作法をここへ閉じ込める）
+    limiter.py     レート制限。バックエンドごとに1つ
+    router.py      main / sub / fallback の振り分け
+    factory.py     プリセットと生成
+    __main__.py    診断CLI (--smoke / --chat / --list-models)
   services/
     capture.py     マイク常時キャプチャ（PortAudio コールバック → asyncio）
     stt.py         VAD + ReazonSpeech 認識、部分認識
     auth.py        ECAPA 話者照合
-    llm.py         Gemini ストリーミング、ツールループ、履歴管理、レート制限
+    llm.py         ストリーミング、ツールループ、履歴管理、文分割
     tts.py         VOICEVOX 文単位ストリーミング再生（中断可能）
     memory.py      events / episodes / profile の3層記憶
     emotion.py     感情推定とエピソード要約
+    profile.py     登録音声からプロフィールを作る
     proactive.py   自発発話のトリガ
   tools/
-    registry.py    @tool デコレータ → FunctionDeclaration 自動生成
+    registry.py    @tool デコレータ → JSON Schema 自動生成
     system.py      アプリ起動 / 音量 / クリップボード / アクティブウィンドウ
     files.py       ファイル検索・読み取り（読み取り専用）
-    web.py         Web検索
+    web.py         Web検索 (Tavily)
     inner.py       remember / feel / set_timer / set_proactive
 scripts/
   fetch_models.py    ONNX モデルの取得
   migrate_memory.py  旧形式の記憶の移行
+tests/             単体テスト（外部通信もモデルのロードも無い）
 main.py            薄いエントリポイント
 ```
 
@@ -83,6 +94,24 @@ main.py            薄いエントリポイント
 
 全二重化した今、この層はもうひとつ役目を持ちます。スピーカーから出た自分の声をマイクが拾い戻しても、**VOICEVOXの合成音声はユーザーの声紋（ECAPA x-vector）に一致しないのでここで落ちる**——事実上のエコーキャンセラとして働きます。加えて、再生中はVADの閾値を上げ、割り込み判定では今読み上げている文と部分認識を照合して回り込みを弾いています。
 
+### 声紋登録で、プロフィールも一緒に取る
+
+声紋を取るにはどうせ十数秒喋ってもらう必要があります。その音声を捨てずに文字起こしして、名前や普段していることを長期記憶（profile 層）の初期値に使います。登録が1回で済み、初回の会話から名前を呼べるようになります。
+
+本数は5本から**2本**に減らし、**1本の長さは固定しませんでした**。話し終わったら「以上」と言うか、何かキーを押すと次へ進みます。
+
+固定秒数だと、言い終わっていないのに切られるか、言い終わったのに黙って待たされるかのどちらかになります。自己紹介の長さは人によって違うので、終わりは本人に決めてもらう方が素直です。下限4秒（声紋に必要な量）と上限60秒（暴走防止）だけ置いています。
+
+終了語の判定は**末尾だけ**を見ます。「以上のことを踏まえて」で切ってしまうと喋っている途中で録音が終わります。また「以上です」のような丁寧形は素の一致では拾えないので、記号と丁寧形を剥がしてから比べています。
+
+カウントダウンは `3 2 1 -> 録音開始` と横一列に出します。1行ずつ改行すると、直前に表示した「何を喋るか」の指示がスクロールで押し出されて見えなくなるためです。
+
+一方で、文字起こしは音声認識を通っているので、**誤認識がそのまま恒久的な事実になる危険があります**。profile は毎ターン全量がプロンプトに載るため、一度入ると会話に効き続けます。そこで三重に防いでいます。
+
+1. LLM に「聞き取れない箇所は推測せず捨てる」と指示する。
+2. それでも従わないので、**コード側で落とす**。実測では `llama3.1:8b` が `['名前は分かりません', '呼ばれ方は分かりません', '天気は分からない', '分からない']` を事実として返してきました。「分からない」旨の文と重複はコードで弾きます。指示だけに頼ると、小さいモデルでは必ず漏れます。
+3. 保存前に一覧を見せて確認を取る。
+
 ### STT を ReazonSpeech に置き換えた理由と、その限界
 
 同じ音声での実測（CPU）:
@@ -104,11 +133,68 @@ Silero VAD をそのまま使うと2つ問題が出ました。どちらも実�
 * **境界が詰まりすぎて音が落ちる。** 元音声の58%しか拾えず、冒頭の一文が丸ごと消えていました。VADに渡した生音声をリングバッファに保持し、切り出した区間の**前後0.3秒を足して**復元することで75%まで戻ります。
 * **`min_silence_duration` 0.35秒では文が割れる。** 一文が3〜4個の断片に分割され、半分だけ聞いて返事をする状態でした。0.7秒に変更しています。これはそのまま「言い終わってから反応するまで」の体感レイテンシになるので、短くしすぎない方が結果的に速く感じます。
 
-### APIレートリミット — 無料枠は5リクエスト/分
+### レートリミットを、待つのではなく無くす
 
-Gemini の無料枠（gemini-2.5-flash）は **5リクエスト/分**です。旧実装の3秒間隔は6倍超過していました。現在は `GEMINI_RPM` から間隔を逆算し、429が返ってきた場合はサーバーが指定する `retryDelay` に従います。
+Gemini の無料枠（gemini-2.5-flash）は **5リクエスト/分**です。これは1リクエストあたり13秒の間隔を意味し、会話としては成立しません。
 
-この制約のため、**感情の更新は応答と同じリクエストの中で `feel` ツールを呼ばせる**方式を既定にしています（API消費0回）。精度優先で別モデルに投げ直したい場合は `TOKA_EMOTION_MODE=separate` です。
+そこで LLM を差し替え可能にし、**既定をローカル実行にしました**。回数制限そのものが消えます。プロバイダは環境変数1つで切り替わります。
+
+```bash
+python -m toka.llm --list                          # プリセットと無料枠の一覧
+python -m toka.llm --provider ollama --smoke       # 4項目を叩いて能力を確認
+python -m toka.llm --provider cerebras --smoke     # 横並びで比較する
+```
+
+| プロバイダ | 無料枠 |
+| :--- | :--- |
+| `ollama` / `lmstudio` | **無制限**（ローカル） |
+| `cerebras` | 30 RPM / 1M tok/日 |
+| `groq` | 30 RPM / 14,400 req/日 |
+| `gemini` | 5 RPM |
+
+Ollama / LM Studio / Cerebras / Groq / OpenRouter はいずれも OpenAI 互換の `/v1/chat/completions` を持つため、**アダプタは1本で4系統を賄えます**（[toka/llm/openai_compat.py](toka/llm/openai_compat.py)）。Gemini だけが独自形式なので、その作法は [toka/llm/gemini.py](toka/llm/gemini.py) に閉じ込めてあります。
+
+レートリミッタはバックエンドごとに1つ持ち、`stream()` と `complete()` の両方が必ず通ります。以前は主応答だけが制限を通り、感情推定・要約・Web検索の3経路が素通りしていて、対策があるように見えて効いていませんでした。ローカルは `rpm=0`（無制限）として経路ごと外します。
+
+`TOKA_LLM_FALLBACK_PROVIDER` を設定すると、ローカルが落ちたときだけクラウド無料枠へ逃がせます。**まだ1文字も流していない場合に限って**切り替えます。喋り始めてからやり直すと同じ内容を二度読み上げることになるためです。
+
+### ローカルモデルの選び方 — 実測した2つの落とし穴
+
+ローカルなら何でもよいわけではなく、**モデル選びで動くか動かないかが決まります**。RX 9070 XT (16GB) で実測しました。
+
+**1. 推論モデルを選ばないこと。** 初トークンまでの時間が `qwen3:14b` で **9.98秒**、非推論モデルで **0.05〜0.22秒**でした。思考の分がそのまま応答の遅れになります。しかも Ollama の `/v1` は `think=false` もプロンプトの `/no_think` も無視するので、モデル側で避けるしかありません。
+
+**2. ツール呼び出しのテンプレートが壊れているモデルがあること。** `qwen2.5:14b` は日本語がやや自然な一方、Ollama 上でツールの区切りトークンが `คณะกรรม` や `_icall_` に化け、呼び出しが解析されないまま生テキストが `content` へ漏れます（読み上げると JSON を音読することになります）。解析成功は **0/4** で、`/v1` でもネイティブ `/api/chat` でも同じでした。ツール数やプロンプト長を変えても再現率は変わりません。`llama3.1:8b` は **4/4** で漏れもゼロだったため、こちらを既定にしています。
+
+このアプリはツールが17個あり、感情更新まで function calling に載せているので、日本語の自然さより呼び出しの確実性を優先しました。導入したモデルが使えるかは `--smoke` で判定できます。
+
+なお漏れは完全には防げないので、**正しい JSON が `content` に漏れていた場合は回収してツール呼び出しとして扱います**（`LeakedToolCallFilter`）。化けた区切りごと読み上げから隠します。
+
+**Windows + RDNA 4 では `OLLAMA_VULKAN=1` が必要です。** Ollama の ROCm は RDNA 3 止まりですが、Vulkan バックエンドで RX 9070 XT が認識されます。CPU 実行と比べて約12倍速く、出力の品質差はありませんでした。
+
+感情の更新は、応答と同じリクエストの中で `feel` ツールを呼ばせる方式を既定にしています。ローカルモデルでツール呼び出しが不安定な場合は `TOKA_EMOTION_MODE=separate` で切り離せます。
+
+### 正直さを、会話の緩さと分けて扱う
+
+「検索できないのに調べたふりをする」のが実際の不満だった。かといって常に厳密だと雑談相手として固すぎる。そこで**声で切り替わる2つのモード**にしました（[toka/services/persona.py](toka/services/persona.py)）。
+
+| モード | 正直度 | ユーモア | 切り替えの合図 |
+| :--- | :--- | :--- | :--- |
+| 会話（既定） | 90 | 55 | 「会話モード」「普通に戻って」 |
+| アシスタント | 100 | 10 | 「まじめに」「アシスタントモード」 |
+
+**ただし「やっていないことをやったと言う」のは、正直度で緩めてよい嘘ではありません。** 確信のないことをどう言うかと、ツールを使っていないのに使ったと言うのは別種の問題です。前者は会話の潤滑油になりえますが、後者はアシスタントとしての信頼を壊します。したがってこれはモードによらず禁止しています。
+
+切り替えは**決定論的なキーワード判定**で行い、LLM のツール呼び出しには頼りません。ローカルモデルはツールを呼び落とすことがあり、モードの切り替えまで取りこぼすと直しようがないためです。ただし「まじめに働いてるんだけどさ」で勝手に切り替わっては困るので、「モード」と明示した語は文中どこでも拾い、「まじめに」のような普通の言い方は発話が12文字以下のときだけ命令とみなします。
+
+**プロンプトに書くだけでは足りませんでした。** 「失敗したら失敗と言う」とシステムプロンプトに書いてあるのに、検索が「キー未設定」で失敗した直後に `（検索結果）現在は115.35円でした` と数字を作ってきました。そこで**失敗したツール結果そのものに指示を添える**形にしています。
+
+```
+[実行失敗] TAVILY_API_KEY が設定されていません。
+この失敗をユーザーにそのまま伝えること。値や結果を推測・創作して答えてはいけない。
+```
+
+離れたシステムプロンプトより、モデルが次に読む場所へ書く方が効きます。これで捏造は再現しなくなりました。profile の事実抽出でも同じ教訓が出ています——**小さいモデルには、指示ではなく構造で守らせる**必要があります。
 
 ### 記憶の3層化
 
@@ -164,10 +250,26 @@ pip install -r requirements.txt
 # ONNX モデルを取得（約3GB、初回のみ）
 python scripts/fetch_models.py
 
-# APIキーを設定
 cp .env-example .env
-# .env を開いて GEMINI_API_KEY を入力
 ```
+
+**LLM を用意します。** 既定はローカルなので、API キーは要りません。
+
+```bash
+# Ollama を入れる（Windows は winget)
+winget install Ollama.Ollama
+
+# Windows + RDNA 4 (RX 9000 系) では Vulkan バックエンドを有効にする。
+# 設定後に Ollama を再起動すること。
+setx OLLAMA_VULKAN 1
+
+ollama pull llama3.1:8b
+
+# 使えるか確認する。4項目すべて OK になれば本体を起動してよい。
+python -m toka.llm --provider ollama --smoke
+```
+
+クラウドの無料枠を使う場合は、`.env` で `TOKA_LLM_PROVIDER` と対応する API キーを設定します（`python -m toka.llm --list` で一覧）。Web検索ツールを使う場合だけ `TAVILY_API_KEY` が別に必要です（無料・クレカ不要）。
 
 旧バージョンから移行する場合は、埋め込みモデルが変わっているのでベクトルの入れ直しが必要です。
 
@@ -185,21 +287,44 @@ python main.py
 # または
 python -m toka --help
 
-python -m toka --model pro          # Gemini Pro を使う
+python -m toka --provider cerebras  # プロバイダを切り替える
+python -m toka --model llama3.1:70b # モデルを切り替える
 python -m toka --stt whisper        # 旧 STT 経路と比較する
 python -m toka --no-proactive       # 自発発話を止める
+python -m toka --no-auth            # 声紋照合を止める（デバッグ用）
 python -m toka --list-devices       # 音声デバイス一覧
 python -m toka -v                   # 詳細ログ
 ```
 
-初回起動時は声紋の登録（5秒×5回）が走ります。
+初回起動時は声紋の登録（2回。長さは「以上」かキーで終了）が走ります。**このとき自己紹介を喋ってもらい、声紋とプロフィールを同時に取ります。**
+
+```
+[1/2] お名前と、どう呼んでほしいかを教えてください。
+  （「以上」と言うか、何かキーを押すと終わります）
+  3 2 1 -> 録音開始
+  録音完了（12秒 / 終了語）
+
+[2/2] 普段パソコンで何をしているか、仕事や趣味を教えてください。
+  ...
+
+次の内容を覚えようとしています:
+  - ユーザーの名前は○○です
+これで覚えていい？ [Y/n]:
+```
+
+登録し直したい場合は `voice_data/*.wav` を消してから起動してください（`memory.json` の `voice_refs` が指すファイルが無くなると自動で再登録が走ります）。
 
 ### 主な環境変数
 
 | 変数 | 既定 | 用途 |
 | :--- | :--- | :--- |
-| `GEMINI_API_KEY` | — | 必須 |
-| `TOKA_GEMINI_RPM` | `5` | 1分あたりのリクエスト上限。有料枠なら上げる |
+| `TOKA_LLM_PROVIDER` | `ollama` | `lmstudio` / `cerebras` / `groq` / `openrouter` / `gemini` |
+| `TOKA_LLM_MODEL` | `llama3.1:8b` | モデル名。`--smoke` で使えるか確認できる |
+| `TOKA_LLM_SUB_PROVIDER` | — | 裏方（感情推定・要約・検索要約）。省略時は主応答と同じ |
+| `TOKA_LLM_FALLBACK_PROVIDER` | — | 主応答が落ちたときの逃げ先 |
+| `GEMINI_API_KEY` | — | `gemini` を使う場合のみ |
+| `CEREBRAS_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` | — | 該当プロバイダを使う場合のみ |
+| `TAVILY_API_KEY` | — | `search_web` に必要（無料・クレカ不要） |
 | `TOKA_STT_ENGINE` | `sherpa` | `whisper` で旧経路 |
 | `TOKA_EMOTION_MODE` | `tool` | `separate` / `keyword` |
 | `TOKA_VOICE_THRESHOLD` | `0.45` | 声紋照合の閾値 |
@@ -211,6 +336,17 @@ python -m toka -v                   # 詳細ログ
 ### 調整用のコマンド
 
 ```bash
+# LLM バックエンドの疎通と能力を確認する（単発 / ストリーミング /
+# ツール呼び出し / 構造化出力 の4項目）
+python -m toka.llm --list
+python -m toka.llm --provider ollama --smoke
+python -m toka.llm --provider ollama --list-models
+python -m toka.llm --provider ollama --chat     # 音声を通さず対話して感触を見る
+
+# テスト（外部通信もモデルのロードも無いので数秒で終わる）
+pip install -r requirements-dev.txt
+pytest
+
 # 声紋の閾値を決める（本人同士のスコア分布を出す）
 python -m toka.services.auth
 

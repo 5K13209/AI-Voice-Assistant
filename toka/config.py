@@ -31,7 +31,9 @@ SAMPLE_RATE = 16000
 # 小さいほど割り込みの反応が速いが、コールバック回数が増える。
 FRAME_SIZE = 320
 
-AUDIO_INPUT_KEYWORDS = ["microphone", "mic", "headset", "マイク"]
+# 「ヘッドセット」を落とさないこと。ASCII の headset だけ入れていたため、
+# 日本語名で出るヘッドセットのマイクが一致せず、OS デフォルトへ落ちていた。
+AUDIO_INPUT_KEYWORDS = ["microphone", "mic", "headset", "マイク", "ヘッドセット"]
 AUDIO_OUTPUT_KEYWORDS = ["speaker", "headset", "headphones", "スピーカー", "ヘッドホン"]
 
 # 明示指定したい場合はデバイス番号を入れる（None なら自動探索）。
@@ -87,8 +89,37 @@ PLAYBACK_CHUNK = 0.05
 # ECAPA のコサインスコア閾値。旧実装の 0.3 はかなり緩い。
 # 自分の環境で voice_check のスコアを見ながら調整すること。
 VOICE_THRESHOLD = float(os.getenv("TOKA_VOICE_THRESHOLD", "0.45"))
-VOICE_ENROLL_SAMPLES = 5
-VOICE_ENROLL_DURATION = 5
+
+# 登録で録る本数。5 本から 2 本に減らしてある。声紋の質は「本数」より
+# 「入っている声の総量」で決まるので、本数ではなく 1 本の長さで稼ぐ。
+VOICE_ENROLL_SAMPLES = 2
+
+# 1 本の長さは固定しない。「以上」と言うか、キーを押すまで録り続ける。
+# 固定秒数だと、言い終わっていないのに切られるか、言い終わったのに黙って
+# 待たされるかのどちらかになる。自己紹介の長さは人によって違う。
+#
+# 下限は声紋に必要な量の確保。これを超えるまでは終了語を探し始めない
+# （「以上」だけ言って終わられると声紋が作れない）。
+VOICE_ENROLL_MIN_SECONDS = 4.0
+
+# 上限は暴走防止。終了語もキーも来なかった場合にここで打ち切る。
+VOICE_ENROLL_MAX_SECONDS = 60.0
+
+# 終了語を探すために、末尾を再デコードする間隔（秒）。
+VOICE_ENROLL_CHECK_INTERVAL = 1.2
+
+# 終了語の判定に使う末尾の長さ（秒）。全体を毎回デコードする必要はない。
+VOICE_ENROLL_TAIL_SECONDS = 4.0
+
+# 終了語の直後に付きうる丁寧形。判定の前に落とす。これを見ないと
+# 「以上です」が「以上」に一致せず、いつまでも録音が止まらない。
+VOICE_ENROLL_POLITE_TAILS = ("ですね", "でした", "です")
+
+# 録音を終える合図。末尾がこれで終わっていたら止める。
+VOICE_ENROLL_STOP_WORDS = (
+    "以上", "いじょう", "終わり", "おわり", "終わりです",
+    "終了", "しゅうりょう", "オッケー", "オーケー",
+)
 
 # 照合を通さず全発話を受け付ける（デバッグ用）。
 VOICE_AUTH_ENABLED = os.getenv("TOKA_VOICE_AUTH", "1") != "0"
@@ -96,17 +127,27 @@ VOICE_AUTH_ENABLED = os.getenv("TOKA_VOICE_AUTH", "1") != "0"
 # =========================
 # ▼ LLM
 # =========================
-GEMINI_MODEL = os.getenv("TOKA_MODEL", "gemini-2.5-flash")
-GEMINI_SUB_MODEL = "gemini-2.5-flash"  # 感情推定・要約などの裏方用
+# プロバイダは環境変数で切り替える。プリセットの一覧と各社の無料枠は
+# `python -m toka.llm --list` で見られる。
+#
+#   ollama    ローカル。回数無制限（既定）
+#   lmstudio  ローカル。回数無制限
+#   cerebras  無料枠 30 RPM / 1M tok/日
+#   groq      無料枠 30 RPM / 14,400 req/日
+#   gemini    無料枠 5 RPM
+#
+# Gemini 無料枠の 5 RPM は、1 リクエストあたり 13 秒の間隔を意味する。
+# 会話としては成立しないので、既定をローカルにした。
+LLM_PROVIDER = os.getenv("TOKA_LLM_PROVIDER", "ollama")
+
+# 裏方（感情推定・エピソード要約・検索結果の要約）に使うプロバイダ。
+# 未指定なら主応答と同じものを兼用する。ローカルなら回数を気にしなくてよい。
+LLM_SUB_PROVIDER = os.getenv("TOKA_LLM_SUB_PROVIDER") or None
+
+# 主応答が落ちたときの逃げ先。未指定なら作らない。
+LLM_FALLBACK_PROVIDER = os.getenv("TOKA_LLM_FALLBACK_PROVIDER") or None
+
 TEMPERATURE = 0.8
-
-# Gemini の 1 分あたりリクエスト上限。無料枠の gemini-2.5-flash は 5。
-# 有料枠に上げたらここを上げる。実測で 429 が出るなら下げる。
-GEMINI_RPM = int(os.getenv("TOKA_GEMINI_RPM", "5"))
-
-# 自主レート制限。旧実装の can_send() は常に True を返す no-op だった。
-# 上限ぴったりだと境界で 429 を踏むので、1 割ほど余裕を持たせる。
-MIN_REQUEST_INTERVAL = 60.0 / GEMINI_RPM * 1.1
 
 # 履歴として保持する会話ターン数。超えた分は episodes に要約して落とす。
 MAX_HISTORY_TURNS = 20
@@ -125,6 +166,24 @@ EMOTION_MAX_DELTA = 5
 #   "keyword"  キーワード加点のみ（API を使わない。旧実装相当）
 # 無料枠は 5 リクエスト/分しかないので、既定は "tool"。
 EMOTION_MODE = os.getenv("TOKA_EMOTION_MODE", "tool")
+
+# =========================
+# ▼ 話し方のモード
+# =========================
+# 「まじめに」「アシスタントモード」と言われたら正確さ優先、
+# 「会話モード」で普段に戻る。切り替えは services/persona.py。
+#
+# 正直度  100 は「知らないことは知らないと言う。推測で埋めない」。
+#         下げると、あやふやなことも会話の流れで言い切るようになる。
+# ユーモア 高いほど冗談・軽口が増える。
+#
+# どちらのモードでも、「使っていないツールを使ったふりをする」ことは
+# 禁止している（PERSONA 側の絶対規則）。正直度で緩めていい部分ではない。
+CONVERSATION_HONESTY = 90
+CONVERSATION_HUMOR = 55
+
+ASSISTANT_HONESTY = 100
+ASSISTANT_HUMOR = 10
 
 # =========================
 # ▼ 記憶

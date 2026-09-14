@@ -23,11 +23,13 @@ log = logging.getLogger(__name__)
 
 KEYS = ("like", "fun", "anger", "sad", "trust")
 
+# 標準 JSON Schema（型名は小文字）。Gemini が要求する大文字への変換は
+# toka/llm/gemini.py が行う。ここでプロバイダ固有の形にしてはいけない。
 _SCHEMA = {
-    "type": "OBJECT",
+    "type": "object",
     "properties": {
         key: {
-            "type": "INTEGER",
+            "type": "integer",
             "description": f"{key} の変化量。-5 から 5。変化なしなら 0",
         }
         for key in KEYS
@@ -97,9 +99,9 @@ def apply(emotion: dict[str, int], delta: dict[str, int]) -> dict[str, int]:
 
 
 class EmotionService:
-    def __init__(self, bus: EventBus, client: Any, memory) -> None:
+    def __init__(self, bus: EventBus, router, memory) -> None:
         self.bus = bus
-        self.client = client
+        self.router = router
         self.memory = memory
 
     async def update(self, user_text: str, assistant_text: str) -> None:
@@ -120,17 +122,11 @@ class EmotionService:
         if config.EMOTION_MODE == "keyword":
             return clamp_delta(KeywordFallback.delta(user_text))
 
-        from google.genai import types
-
         try:
-            response = await self.client.aio.models.generate_content(
-                model=config.GEMINI_SUB_MODEL,
-                contents=_PROMPT.format(user=user_text, assistant=assistant_text),
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=_SCHEMA,
-                    temperature=0.0,
-                ),
+            raw = await self.router.complete_sub(
+                _PROMPT.format(user=user_text, assistant=assistant_text),
+                schema=_SCHEMA,
+                temperature=0.0,
             )
         except Exception as exc:
             log.debug("感情推定に失敗、キーワード規則にフォールバック: %s", exc)
@@ -139,10 +135,14 @@ class EmotionService:
         import json
 
         try:
-            return clamp_delta(json.loads(response.text))
+            parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             log.debug("感情推定の応答を解釈できず、キーワード規則にフォールバック")
             return clamp_delta(KeywordFallback.delta(user_text))
+
+        if not isinstance(parsed, dict):
+            return clamp_delta(KeywordFallback.delta(user_text))
+        return clamp_delta(parsed)
 
 
 class EpisodeSummarizer:
@@ -158,8 +158,8 @@ class EpisodeSummarizer:
 {transcript}
 """
 
-    def __init__(self, client: Any, memory) -> None:
-        self.client = client
+    def __init__(self, router, memory) -> None:
+        self.router = router
         self.memory = memory
         self._lock = asyncio.Lock()
 
@@ -177,11 +177,12 @@ class EpisodeSummarizer:
                 return
 
             try:
-                response = await self.client.aio.models.generate_content(
-                    model=config.GEMINI_SUB_MODEL,
-                    contents=self.PROMPT.format(transcript=transcript),
-                )
-                summary = (response.text or "").strip()
+                summary = (
+                    await self.router.complete_sub(
+                        self.PROMPT.format(transcript=transcript),
+                        temperature=0.3,
+                    )
+                ).strip()
             except Exception:
                 log.exception("エピソードの要約に失敗")
                 return

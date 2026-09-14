@@ -1,7 +1,13 @@
 # --- LLM ---
-google-genai==2.6.0
+# プロバイダは環境変数で切り替える（python -m toka.llm --list で一覧）。
+# ローカル (Ollama / LM Studio) と Groq / Cerebras / OpenRouter は
+# すべて OpenAI 互換なので、httpx だけで話せる。
+httpx==0.28.1
 python-dotenv==1.2.2
 requests==2.34.2
+
+# Gemini を使う場合のみ必要。ローカル運用なら外して構わない。
+google-genai==2.6.0
 
 # --- 音声認識 (sherpa-onnx + ReazonSpeech) ---
 # CPU の ONNX 推論のみ。CUDA も PyTorch も要らない。
@@ -34,3 +40,6 @@ pyperclip==1.11.0
 # --- 任意: 旧 STT 経路との比較用 ---
 # TOKA_STT_ENGINE=whisper で使う。精度を自分の環境で比べたいときだけ。
 # faster-whisper==1.2.1
+
+# --- 開発用 ---
+# pip install -r requirements-dev.txt で入れる（本体の実行には不要）。

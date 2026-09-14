@@ -51,54 +51,242 @@ def voiced_ratio(samples: np.ndarray, frame: int = 1600) -> float:
     return float((np.sqrt((frames**2).mean(axis=1)) > 0.01).mean())
 
 
-class RegisterVoice:
-    """声紋サンプルの登録。"""
+# 認識結果の末尾に付きうる記号。判定の前に落とす。
+PUNCTUATION = "。．.、,！!？?　 "
 
-    # これを下回るサンプルは録り直す。5 秒中 1.5 秒は声が入っていてほしい。
+
+def ends_with_stop_word(text: str) -> bool:
+    """認識結果の末尾が終了語かどうか。
+
+    **末尾だけ**を見るのが要点。「以上のことを踏まえて」のように文中へ
+    現れた場合に切ってしまうと、喋っている途中で録音が終わる。
+    認識結果には句読点が付かないこともあるので、記号を落としてから比べる。
+    """
+    cleaned = peel_polite(text)
+    if not cleaned:
+        return False
+    return any(cleaned.endswith(word) for word in config.VOICE_ENROLL_STOP_WORDS)
+
+
+def peel_polite(text: str) -> str:
+    """末尾の記号と丁寧形を落とす。終了語の判定を揺れに強くする。
+
+    「以上です。」を素の endswith("以上") で見ると一致しない。実測でも
+    ここが最初に漏れた。
+    """
+    cleaned = (text or "").strip().rstrip(PUNCTUATION)
+    for tail in config.VOICE_ENROLL_POLITE_TAILS:
+        if cleaned.endswith(tail):
+            cleaned = cleaned[: -len(tail)].rstrip(PUNCTUATION)
+            break
+    return cleaned
+
+
+class _KeyStop:
+    """キーが押されたかを、標準入力をブロックせずに調べる。
+
+    input() を別スレッドで待つ形にはしない。押されないまま録音が終わると
+    そのスレッドが stdin を掴んだままになり、直後の「これで覚えていい？」
+    の答えを横取りしてしまう。Windows では msvcrt で覗くだけにする。
+
+    msvcrt が無い環境（Linux / パイプ経由）ではキーでは止められないので、
+    終了語と上限秒数だけで止める。
+    """
+
+    def __init__(self) -> None:
+        try:
+            import msvcrt
+        except ImportError:  # pragma: no cover - Windows 以外
+            self._msvcrt = None
+        else:
+            self._msvcrt = msvcrt
+
+    @property
+    def available(self) -> bool:
+        return self._msvcrt is not None
+
+    def drain(self) -> None:
+        """録音前に溜まっている入力を捨てる。前の Enter で即終了しないように。"""
+        if self._msvcrt is None:
+            return
+        while self._msvcrt.kbhit():
+            self._msvcrt.getch()
+
+    def pressed(self) -> bool:
+        if self._msvcrt is None:
+            return False
+        hit = False
+        while self._msvcrt.kbhit():
+            self._msvcrt.getch()
+            hit = True
+        return hit
+
+
+class RegisterVoice:
+    """声紋サンプルの登録。
+
+    録る内容を「何でもよい」から**自己紹介**に変えてある。声紋を取るために
+    どうせ十数秒喋ってもらう必要があるので、その音声をそのまま文字起こしして
+    プロフィール（名前・呼ばれ方・普段していること）の初期値にも使う。
+    ユーザーから見れば、登録が 1 回で済んで名前まで覚えてくれることになる。
+    抽出は ProfileEnroller（services/profile.py）が受け持つ。
+    """
+
+    # これを下回るサンプルは録り直す。総時間の 3 割は声が入っていてほしい。
     MIN_VOICED_RATIO = 0.3
     MAX_ATTEMPTS = 3
 
-    @staticmethod
-    def record_one(output_path, duration: int, samplerate: int) -> str:
-        # 何の予告もなく録り始めると話し出しに間に合わず、質の低い
-        # プロファイルが登録されてしまう。カウントダウンを入れる。
-        for count in (3, 2, 1):
-            print(f"  {count}...", flush=True)
-            time.sleep(1)
-        print(f"  録音開始（{duration}秒間、話し続けてください）", flush=True)
-
-        frames = int(duration * samplerate)
-        recording = sd.rec(frames, samplerate=samplerate, channels=1, dtype="float32")
-        sd.wait()
-        sf.write(output_path, recording, samplerate)
-        print("  録音完了", flush=True)
-        return str(output_path)
+    # 何を喋ればよいか分からないと黙ってしまい、無音のサンプルが登録される。
+    # 本数を増やしたときは末尾の汎用文で埋める。
+    PROMPTS = (
+        "お名前と、どう呼んでほしいかを教えてください。",
+        "普段パソコンで何をしているか、仕事や趣味を教えてください。",
+        "好きなものや、覚えておいてほしいことを話してください。",
+    )
+    GENERIC_PROMPT = "何でも構いません。途切れずに話し続けてください。"
 
     @classmethod
-    def record_checked(cls, output_path, duration: int, samplerate: int) -> str | None:
+    def prompt_for(cls, index: int) -> str:
+        """index 本目に喋ってもらう内容。"""
+        if index < len(cls.PROMPTS):
+            return cls.PROMPTS[index]
+        return cls.GENERIC_PROMPT
+
+    @staticmethod
+    def _countdown() -> None:
+        """開始までのカウントダウン。1 行に横並びで出す。
+
+        1 行ずつ改行して出していたが、それだと直前に表示した「何を喋るか」
+        の指示がスクロールで押し出されて見えなくなる。行を増やさず、
+        数字だけ横に伸ばす。
+        """
+        print("  ", end="", flush=True)
+        for count in (3, 2, 1):
+            print(f"{count} ", end="", flush=True)
+            time.sleep(1)
+        print("-> 録音開始", flush=True)
+
+    @classmethod
+    def record_one(cls, output_path, samplerate: int, *, transcriber=None) -> str:
+        """終了語かキー入力まで録り続ける。
+
+        固定秒数をやめた理由が 2 つある。言い終わっていないのに切られると
+        自己紹介が途中で終わるし、逆に言い終わったのに黙って待たされるのも
+        無駄になる。自己紹介の長さは人によって違う。
+
+        止まる条件は 3 つ。「以上」などの終了語、キー入力、上限秒数。
+        終了語は下限秒数を超えてから探し始める（「以上」だけ言って
+        終わられると声紋が作れない）。
+        """
+        keys = _KeyStop()
+        keys.drain()
+
+        if transcriber is not None and keys.available:
+            hint = "「以上」と言うか、何かキーを押すと終わります"
+        elif transcriber is not None:
+            hint = "「以上」と言うと終わります"
+        elif keys.available:
+            hint = "何かキーを押すと終わります"
+        else:
+            hint = f"{config.VOICE_ENROLL_MAX_SECONDS:.0f}秒で自動的に終わります"
+        print(f"  （{hint}）", flush=True)
+
+        cls._countdown()
+
+        chunks: list[np.ndarray] = []
+
+        def callback(indata, frames_count, time_info, status) -> None:
+            # コールバックは PortAudio のスレッドから呼ばれる。バッファは
+            # 再利用されるのでコピーを取る。
+            chunks.append(indata.copy())
+
+        reason = "上限"
+        elapsed = 0.0
+        with sd.InputStream(
+            samplerate=samplerate, channels=1, dtype="float32", callback=callback
+        ):
+            started = time.monotonic()
+            last_check = 0.0
+            while True:
+                time.sleep(0.05)
+                elapsed = time.monotonic() - started
+
+                if keys.pressed():
+                    reason = "キー"
+                    break
+                if elapsed >= config.VOICE_ENROLL_MAX_SECONDS:
+                    break
+                if transcriber is None:
+                    continue
+                if elapsed < config.VOICE_ENROLL_MIN_SECONDS:
+                    continue
+                if elapsed - last_check < config.VOICE_ENROLL_CHECK_INTERVAL:
+                    continue
+
+                last_check = elapsed
+                tail = cls._tail(chunks, samplerate)
+                if tail is None:
+                    continue
+                if ends_with_stop_word(transcriber.transcribe(tail)):
+                    reason = "終了語"
+                    break
+
+        samples = (
+            np.concatenate(chunks).ravel()
+            if chunks
+            else np.zeros(0, dtype=np.float32)
+        )
+        sf.write(output_path, samples, samplerate)
+        print(f"  録音完了（{elapsed:.0f}秒 / {reason}）", flush=True)
+        return str(output_path)
+
+    @staticmethod
+    def _tail(chunks: list, samplerate: int):
+        """終了語の判定に使う末尾を切り出す。
+
+        毎回全体をデコードする必要はない。終了語は末尾にしか現れない。
+        """
+        if not chunks:
+            return None
+        samples = np.concatenate(chunks).ravel()
+        want = int(config.VOICE_ENROLL_TAIL_SECONDS * samplerate)
+        return samples[-want:] if len(samples) > want else samples
+
+    @classmethod
+    def record_checked(
+        cls, output_path, samplerate: int, *, transcriber=None
+    ) -> str | None:
         """声が十分に入るまで録り直す。"""
         for attempt in range(cls.MAX_ATTEMPTS):
-            path = cls.record_one(output_path, duration, samplerate)
+            path = cls.record_one(output_path, samplerate, transcriber=transcriber)
             samples, _ = sf.read(path, dtype="float32", always_2d=False)
             if samples.ndim > 1:
                 samples = samples.mean(axis=1)
 
             ratio = voiced_ratio(samples)
-            if ratio >= cls.MIN_VOICED_RATIO:
+            duration = len(samples) / samplerate
+            if ratio >= cls.MIN_VOICED_RATIO and duration >= config.VOICE_ENROLL_MIN_SECONDS:
                 print(f"  （声の割合 {ratio * 100:.0f}%）", flush=True)
                 return path
 
             remaining = cls.MAX_ATTEMPTS - attempt - 1
+            if duration < config.VOICE_ENROLL_MIN_SECONDS:
+                trouble = f"短すぎます（{duration:.0f}秒）。"
+            else:
+                trouble = f"声がほとんど入っていません（{ratio * 100:.0f}%）。"
             print(
-                f"  声がほとんど入っていません（{ratio * 100:.0f}%）。"
+                "  " + trouble
                 + (f"録り直します（残り{remaining}回）" if remaining else "先に進みます"),
                 flush=True,
             )
         return None
 
     @classmethod
-    def register(cls) -> list[str]:
+    def register(cls, transcriber=None) -> list[str]:
         """VOICE_ENROLL_SAMPLES 本を録って、そのパスを返す。
+
+        transcriber を渡すと「以上」で録音を終われる。渡さない場合は
+        キー入力と上限秒数だけで止まる。
 
         パスは相対で返す。絶対パスを memory.json に書くと、リポジトリを
         別の場所へ移したときに全部無効になる。
@@ -107,15 +295,15 @@ class RegisterVoice:
         paths: list[str] = []
 
         print(f"\n声紋を登録します（全{config.VOICE_ENROLL_SAMPLES}回）")
-        print(f"1回につき{config.VOICE_ENROLL_DURATION}秒、途切れずに話し続けてください。")
-        print("読み上げる内容は何でも構いません。\n")
+        print("話し終わったら「以上」と言うか、何かキーを押してください。")
+        print("話した内容から、名前などのプロフィールも一緒に覚えます。\n")
 
         for index in range(config.VOICE_ENROLL_SAMPLES):
-            print(f"[{index + 1}/{config.VOICE_ENROLL_SAMPLES}] 準備してください")
+            print(f"[{index + 1}/{config.VOICE_ENROLL_SAMPLES}] {cls.prompt_for(index)}")
             path = cls.record_checked(
                 config.VOICE_DATA_DIR / f"voice_{index}.wav",
-                config.VOICE_ENROLL_DURATION,
                 config.SAMPLE_RATE,
+                transcriber=transcriber,
             )
             if path:
                 paths.append(str(Path(path).relative_to(config.ROOT)))

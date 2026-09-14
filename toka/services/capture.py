@@ -60,13 +60,24 @@ class AudioCapture:
         if self._stream is not None:
             return
         self._loop = self._loop or asyncio.get_running_loop()
-        self._stream = sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=FRAME_SIZE,
-            dtype="int16",
-            channels=1,
-            callback=self._callback,
-        )
+        try:
+            self._stream = sd.RawInputStream(
+                samplerate=SAMPLE_RATE,
+                blocksize=FRAME_SIZE,
+                dtype="int16",
+                channels=1,
+                callback=self._callback,
+            )
+        except sd.PortAudioError as exc:
+            # 既定の録音デバイスが無いと device=-1 の照会に失敗する。
+            # 生のトレースバックだけ出ても原因が分からないので言い換える。
+            raise SystemExit(
+                f"マイクを開けませんでした: {exc}\n"
+                "録音デバイスが接続・有効になっているか確認してください。\n"
+                "  一覧: python -m toka --list-devices\n"
+                "Windows のサウンド設定で既定の入力デバイスが選ばれていないと、"
+                "デバイスが一覧に出ていても開けません。"
+            ) from exc
         self._stream.start()
         log.info(
             "マイク常時キャプチャ開始 (%d Hz, %d サンプル/フレーム)",

@@ -19,9 +19,12 @@ from dotenv import load_dotenv
 from . import config
 from .audio_devices import describe_devices, select_devices
 from .bus import EventBus
+from .llm import BackendError, build_router
+from .llm import describe as describe_providers
 from .events import (
     AssistantMessage,
     BargeIn,
+    ModeChanged,
     PartialTranscript,
     ProactiveImpulse,
     SpeakerRejected,
@@ -34,6 +37,9 @@ from .services.capture import AudioCapture
 from .services.emotion import EmotionService, EpisodeSummarizer
 from .services.llm import LLMService
 from .services.memory import MemoryManager
+from .services import persona
+from .services.persona import Mode
+from .services.profile import ProfileEnroller
 from .services.proactive import ProactiveService
 from .services.stt import STTService
 from .services.tts import TTSService, check_available
@@ -65,6 +71,7 @@ class Application:
         self.capture = AudioCapture()
         self.tts = TTSService(self.bus)
         self.stt: STTService | None = None
+        self.router = None
         self.llm: LLMService | None = None
         self.emotion: EmotionService | None = None
         self.summarizer: EpisodeSummarizer | None = None
@@ -73,6 +80,9 @@ class Application:
 
         self._response_task: asyncio.Task | None = None
         self._last_user_text = ""
+        # 今回の起動で声紋を録り直した場合だけ、その音声からプロフィールを
+        # 作る。毎回やると同じ事実を作り直すことになるため。
+        self._fresh_enrollment: list[str] = []
 
     # =========================
     # ▼ 状態
@@ -91,16 +101,22 @@ class Application:
     # ▼ 起動
     # =========================
 
-    def _make_client(self):
-        from google import genai
+    def _make_router(self):
+        """LLM バックエンドを組む。
 
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise SystemExit(
-                "GEMINI_API_KEY が設定されていません。"
-                ".env-example を .env にコピーしてキーを入れてください。"
+        プロバイダごとに必要な前提（鍵の有無、ローカルサーバーの起動）が
+        違うので、失敗したら何をすればよいかを添えて止める。
+        """
+        try:
+            return build_router(
+                main=config.LLM_PROVIDER,
+                sub=config.LLM_SUB_PROVIDER,
+                fallback=config.LLM_FALLBACK_PROVIDER,
             )
-        return genai.Client(api_key=api_key)
+        except BackendError as exc:
+            raise SystemExit(
+                f"{exc}\n\n使えるプロバイダ:\n{describe_providers()}"
+            ) from exc
 
     def _ensure_voice_enrolled(self) -> VoiceAuth | None:
         if not config.VOICE_AUTH_ENABLED:
@@ -112,8 +128,12 @@ class Application:
         if not refs or missing:
             if missing:
                 log.info("登録済みの音声ファイルが見つからないため登録し直します")
-            refs = RegisterVoice.register()
+            # 認識器を渡すと「以上」で録音を終われる。STT は既に
+            # ロード済みなので、登録用に読み直す必要はない。
+            transcriber = self.stt.transcriber if self.stt is not None else None
+            refs = RegisterVoice.register(transcriber)
             self.memory.voice_refs = refs
+            self._fresh_enrollment = list(refs)
 
         return VoiceAuth(refs)
 
@@ -126,9 +146,21 @@ class Application:
                 f"接続先: {config.VOICEVOX_URL}"
             )
 
-        client = self._make_client()
+        self.router = self._make_router()
         registry = load_all()
-        tool_context.bind(self.bus, self.memory, client)
+        tool_context.bind(self.bus, self.memory, self.router)
+
+        # ローカルバックエンドはサーバーが動いていないと何も返さない。
+        # 起動時に一度だけ確かめて、駄目なら理由を出して止める。
+        if not await self.router.main.healthy():
+            raise SystemExit(
+                f"{self.router.main.name} に接続できません。\n"
+                "ローカルなら次を確認してください:\n"
+                "  Ollama:    ollama serve が動いているか\n"
+                "  LM Studio: サーバーを開始しているか\n"
+                "疎通と能力の確認は次で行えます:\n"
+                f"  python -m toka.llm --provider {config.LLM_PROVIDER} --smoke"
+            )
 
         # モデルのロードはどれも数秒かかる。まとめて executor に逃がす。
         loop = asyncio.get_running_loop()
@@ -137,9 +169,20 @@ class Application:
         voice_auth = await loop.run_in_executor(None, self._ensure_voice_enrolled)
         self.auth_service = AuthService(self.bus, voice_auth)
 
-        self.llm = LLMService(self.bus, client, self.memory, registry, self.tts)
-        self.emotion = EmotionService(self.bus, client, self.memory)
-        self.summarizer = EpisodeSummarizer(client, self.memory)
+        self.llm = LLMService(self.bus, self.router, self.memory, registry, self.tts)
+        self.emotion = EmotionService(self.bus, self.router, self.memory)
+        self.summarizer = EpisodeSummarizer(self.router, self.memory)
+
+        # 声紋を録り直したときは、その音声からプロフィールも作る。
+        # 失敗しても起動は続ける（名前を覚えられないだけで会話は成立する）。
+        if self._fresh_enrollment:
+            enroller = ProfileEnroller(self.router, self.memory)
+            try:
+                await enroller.enroll(
+                    self._fresh_enrollment, self.stt.transcriber
+                )
+            except Exception:
+                log.exception("プロフィールの登録に失敗")
 
         self.capture.start()
         log.info("感情: %s", self.memory.emotion)
@@ -158,10 +201,51 @@ class Application:
                 self.llm.resolve_confirmation(event.text)
                 continue
 
+            # 「まじめに」「会話モード」などはモードの切り替え指示。
+            # LLM のツール呼び出しには頼らず、ここで決定論的に処理する。
+            text = self._apply_mode_switch(event.text)
+            if text is None:
+                continue
+
             await self._cancel_response()
             self._response_task = asyncio.create_task(
-                self._respond(event.text), name="respond"
+                self._respond(text), name="respond"
             )
+
+    def _apply_mode_switch(self, text: str) -> str | None:
+        """モードの切り替え指示を処理し、質問として残った部分を返す。
+
+        切り替えだけの発話だったときは None を返す。LLM に投げても
+        「はい」しか返らないので、こちらで短く応じて終わりにする。
+        """
+        requested = persona.detect(text)
+        if requested is None:
+            return text
+
+        remainder = persona.strip_triggers(text)
+
+        if requested is not self.llm.mode:
+            self.llm.mode = requested
+            honesty, humor = persona.dials(requested)
+            log.info(
+                "モード切替: %s（正直度 %d / ユーモア %d）",
+                requested.value, honesty, humor,
+            )
+            self.bus.publish(
+                ModeChanged(mode=requested.value, honesty=honesty, humor=humor)
+            )
+            if not remainder:
+                self.tts.say(
+                    "アシスタントモードにした。正確さを優先する。"
+                    if requested is Mode.ASSISTANT
+                    else "会話モードに戻した。"
+                )
+                return None
+        elif not remainder:
+            self.tts.say("もうそのモードだよ。")
+            return None
+
+        return remainder
 
     async def _handle_rejections(self) -> None:
         async for event in self.bus.stream(SpeakerRejected):
@@ -317,6 +401,10 @@ class Application:
                 tg.create_task(self.proactive.run(), name="proactive")
         finally:
             self.shutdown()
+            if self.router is not None:
+                # HTTP クライアントを閉じる。閉じないと asyncio が終了時に
+                # 「Unclosed client session」を吐く。
+                await self.router.close()
 
     def shutdown(self) -> None:
         from .tools import inner
@@ -340,18 +428,28 @@ def setup_logging(verbose: bool) -> None:
         datefmt="%H:%M:%S",
     )
     # 依存ライブラリのログは黙らせる。
-    for noisy in ("httpx", "urllib3", "chromadb", "sentence_transformers",
-                  "speechbrain", "asyncio", "google_genai", "numba", "matplotlib"):
+    for noisy in ("httpx", "httpcore", "urllib3", "chromadb",
+                  "sentence_transformers", "speechbrain", "asyncio",
+                  "google_genai", "numba", "matplotlib"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="toka", description="音声アシスタント トーカ")
+    parser = argparse.ArgumentParser(
+        prog="toka",
+        description="音声アシスタント トーカ",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="LLM プロバイダ:\n" + describe_providers(),
+    )
+    parser.add_argument(
+        "--provider",
+        help="LLM プロバイダ。既定は TOKA_LLM_PROVIDER、無ければ ollama",
+    )
+    # 既定値を持たせない。持たせると、指定していないのに毎回上書きされて
+    # 環境変数 TOKA_LLM_MODEL が効かなくなる（以前はそうなっていた）。
     parser.add_argument(
         "--model",
-        choices=["flash", "pro"],
-        default="flash",
-        help="Gemini のモデル（既定: flash）",
+        help="モデル名を上書きする（例: qwen2.5:14b, gemini-2.5-pro）",
     )
     parser.add_argument(
         "--stt",
@@ -374,7 +472,13 @@ async def main(argv: list[str] | None = None) -> int:
         print(describe_devices())
         return 0
 
-    config.GEMINI_MODEL = f"gemini-2.5-{args.model}"
+    # 明示されたときだけ上書きする。--model は factory が読む環境変数へ
+    # 流し込む形にして、プロバイダ非依存にしておく。
+    if args.provider:
+        config.LLM_PROVIDER = args.provider
+    if args.model:
+        os.environ["TOKA_LLM_MODEL"] = args.model
+
     if args.stt:
         config.STT_ENGINE = args.stt
     if args.no_auth:

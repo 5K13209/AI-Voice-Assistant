@@ -11,10 +11,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..bus import EventBus
+    from ..llm import LLMRouter
     from ..services.memory import MemoryManager
 
 
@@ -22,7 +23,9 @@ if TYPE_CHECKING:
 class ToolContext:
     bus: EventBus | None = None
     memory: MemoryManager | None = None
-    genai_client: Any | None = None
+    # 検索結果の要約などに使う。プロバイダ非依存の router を持つので、
+    # ツール側は Gemini でもローカルでも同じコードで動く。
+    llm_router: LLMRouter | None = None
     # 自発発話のオン・オフ。ユーザーが「黙ってて」と言えるようにする。
     proactive_enabled: bool = True
 
@@ -30,7 +33,7 @@ class ToolContext:
 CONTEXT = ToolContext()
 
 
-def bind(bus, memory, genai_client) -> None:
+def bind(bus, memory, llm_router) -> None:
     CONTEXT.bus = bus
     CONTEXT.memory = memory
-    CONTEXT.genai_client = genai_client
+    CONTEXT.llm_router = llm_router

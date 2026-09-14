@@ -180,6 +180,15 @@ class EmotionChanged(Event):
 
 
 @dataclass
+class ModeChanged(Event):
+    """話し方のモードが切り替わった。UI で表示するのに使える。"""
+
+    mode: str
+    honesty: int
+    humor: int
+
+
+@dataclass
 class MemoryStored(Event):
     kind: str  # "event" | "episode" | "profile"
     text: str

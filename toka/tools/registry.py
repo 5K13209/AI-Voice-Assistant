@@ -1,12 +1,16 @@
-"""ツール登録。Python 関数から Gemini の FunctionDeclaration を組み立てる。
+"""ツール登録。Python 関数から関数宣言スキーマを組み立てる。
 
     @tool(risk="safe", params={"name": "アプリの通称"})
     def open_app(name: str) -> str:
         '''許可されたアプリケーションを起動する。'''
 
-google-genai には Python 関数をそのまま渡す自動関数呼び出しがあるが、使わない。
+SDK には Python 関数をそのまま渡す自動関数呼び出しがあるが、使わない。
 確認ゲートを挟みたいこと、asyncio 上で実行したいこと、割り込みでキャンセル
 できる必要があること、の 3 つが理由。呼び出しループは llm.py 側に持つ。
+
+出力は**標準 JSON Schema**（型名は小文字）。以前は Gemini が要求する大文字の
+"OBJECT"/"INTEGER" を直接吐いていたが、それではプロバイダを替えられない。
+大文字への変換は toka/llm/gemini.py の to_gemini_schema が受け持つ。
 """
 
 from __future__ import annotations
@@ -22,13 +26,13 @@ log = logging.getLogger(__name__)
 
 Risk = Literal["safe", "confirm"]
 
-_PY_TO_GEMINI = {
-    str: "STRING",
-    int: "INTEGER",
-    float: "NUMBER",
-    bool: "BOOLEAN",
-    list: "ARRAY",
-    dict: "OBJECT",
+_PY_TO_JSON_SCHEMA = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
 }
 
 
@@ -50,9 +54,25 @@ class Tool:
         detail = "、".join(f"{k}={v}" for k, v in args.items()) or "引数なし"
         return self.confirm_template.format(name=self.name, args=detail)
 
+    def _signature(self) -> inspect.Signature:
+        """注釈を実型に解決したシグネチャを返す。
+
+        ツールのモジュールは `from __future__ import annotations` を使って
+        いるので、素の inspect.signature では注釈が文字列 "int" のまま返る。
+        すると型の対応表を引けず、**全ての引数が string として宣言される**。
+        実際 set_volume(percent: int) と set_timer(seconds: int) は整数だと
+        LLM に伝わっていなかった。eval_str=True で解決する。
+        """
+        try:
+            return inspect.signature(self.func, eval_str=True)
+        except (NameError, TypeError):
+            # 解決できない注釈がある場合。string 扱いに落ちるが動きはする。
+            log.debug("%s の注釈を解決できません", self.name, exc_info=True)
+            return inspect.signature(self.func)
+
     def declaration(self) -> dict[str, Any]:
-        """Gemini の FunctionDeclaration に渡す dict を作る。"""
-        signature = inspect.signature(self.func)
+        """関数宣言を標準 JSON Schema の dict として作る。"""
+        signature = self._signature()
         properties: dict[str, Any] = {}
         required: list[str] = []
 
@@ -66,13 +86,13 @@ class Tool:
                 )
 
             properties[param_name] = {
-                "type": _PY_TO_GEMINI.get(annotation, "STRING"),
+                "type": _PY_TO_JSON_SCHEMA.get(annotation, "string"),
                 "description": self.params.get(param_name, param_name),
             }
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
-        schema: dict[str, Any] = {"type": "OBJECT", "properties": properties}
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
         if required:
             schema["required"] = required
 
